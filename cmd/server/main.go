@@ -9,9 +9,11 @@ import (
 
 	"github.com/go-chi/chi/middleware"
 
-	"eridiumdev/yandex-praktikum-go-devops/internal/commons/logger"
-	"eridiumdev/yandex-praktikum-go-devops/internal/commons/routing"
-	"eridiumdev/yandex-praktikum-go-devops/internal/commons/templating"
+	"eridiumdev/yandex-praktikum-go-devops/config"
+	"eridiumdev/yandex-praktikum-go-devops/internal/common/logger"
+	"eridiumdev/yandex-praktikum-go-devops/internal/common/routing"
+	"eridiumdev/yandex-praktikum-go-devops/internal/common/templating"
+	"eridiumdev/yandex-praktikum-go-devops/internal/metrics/backup"
 	metricsHttpDelivery "eridiumdev/yandex-praktikum-go-devops/internal/metrics/delivery/http"
 	metricsRendering "eridiumdev/yandex-praktikum-go-devops/internal/metrics/rendering"
 	metricsRepository "eridiumdev/yandex-praktikum-go-devops/internal/metrics/repository"
@@ -19,61 +21,78 @@ import (
 )
 
 const (
-	LogLevel = logger.LevelInfo
+	LogLevel = logger.LevelDebug
 	LogMode  = logger.ModeDevelopment
-
-	HTTPHost = "127.0.0.1"
-	HTTPPort = 8080
-
-	ShutdownTimeout = 3 * time.Second
 )
 
 func main() {
-	// Init context
-	ctx := context.Background()
+	// Init logger and context
+	ctx := logger.Init(context.Background(), LogLevel, LogMode)
+	logger.New(ctx).Infof("Logger started")
 
-	// Init logger
-	logger.Init(LogLevel, LogMode)
-	logger.Infof("Logger started")
+	// Get context with cancel func for graceful shutdown
+	ctx, cancel := context.WithCancel(ctx)
+
+	// Init config
+	cfg, err := config.LoadServerConfig(config.FromEnv)
+	if err != nil {
+		logger.New(ctx).Fatalf("Cannot load config: %s", err.Error())
+	}
 
 	// Init repos
-	metricsRepo := metricsRepository.NewInMemRepo()
+	inMemRepo := metricsRepository.NewInMemRepo()
+
+	// Init backupers
+	fileBackuper, err := backup.NewFileBackuper(ctx, cfg.BackuperFilePath)
+	if err != nil {
+		logger.New(ctx).Fatalf("Cannot init file backuper: %s", err.Error())
+	}
 
 	// Init services
-	metricsService := _metricsService.NewMetricsService(metricsRepo)
+	metricsService, err := _metricsService.NewMetricsService(ctx, inMemRepo, fileBackuper, cfg.Backup)
+	if err != nil {
+		logger.New(ctx).Fatalf("Cannot init metrics service: %s", err.Error())
+	}
 
 	// Init rendering engines
 	templateParser := templating.NewHTMLTemplateParser("web/templates")
 	metricsRenderer := metricsRendering.NewHTMLEngine(templateParser)
 
 	// Init router
-	router := routing.NewChiRouter(logger.Middleware, middleware.Recoverer)
+	router := routing.NewChiRouter(logger.Middleware, routing.URLMiddleware, middleware.Recoverer)
 
 	// Init handlers
 	_ = metricsHttpDelivery.NewMetricsHandler(router, metricsService, metricsRenderer)
 
 	// Init HTTP server
-	server := NewServer(router.GetHandler(), ServerSettings{
-		Host: HTTPHost,
-		Port: HTTPPort,
-	})
+	server := NewServer(router.GetHandler(), cfg)
 
 	// Start server
-	logger.Infof("Starting HTTP server on %s:%d", HTTPHost, HTTPPort)
-	go server.Start()
+	logger.New(ctx).Infof("Starting HTTP server on %s", cfg.Address)
+	go server.Start(ctx)
 
 	// Handle OS signals for graceful shutdown
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	sig := <-quit
-	logger.Infof("OS signal received: %s", sig)
+	logger.New(ctx).Infof("OS signal received: %s", sig)
 
-	// Allow some time for collectors/exporters to finish their job
-	time.AfterFunc(ShutdownTimeout, func() {
-		logger.Fatalf("Server force-stopped (shutdown timeout)")
+	// Allow some time for server and components to clean up
+	time.AfterFunc(time.Duration(cfg.ShutdownTimeout), func() {
+		cleanup(cancel, time.Second)
+		logger.New(ctx).Fatalf("Server force-stopped (shutdown timeout)")
 	})
 
 	// Stop the server
 	server.Stop(ctx)
-	logger.Infof("Server stopped")
+	logger.New(ctx).Infof("Server stopped")
+
+	// Clean-up other components, e.g. backuper
+	cleanup(cancel, time.Second)
+}
+
+func cleanup(cancel context.CancelFunc, wait time.Duration) {
+	cancel()
+	time.Sleep(wait)
+	logger.New(context.Background()).Infof("Clean-up finished")
 }

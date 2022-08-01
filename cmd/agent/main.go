@@ -7,56 +7,50 @@ import (
 	"syscall"
 	"time"
 
-	"eridiumdev/yandex-praktikum-go-devops/internal/commons/logger"
+	"eridiumdev/yandex-praktikum-go-devops/config"
+	"eridiumdev/yandex-praktikum-go-devops/internal/common/logger"
 	"eridiumdev/yandex-praktikum-go-devops/internal/metrics/buffering"
 	"eridiumdev/yandex-praktikum-go-devops/internal/metrics/executors/collectors"
 	"eridiumdev/yandex-praktikum-go-devops/internal/metrics/executors/exporters"
 )
 
 const (
-	LogExporter  = 0x01
-	HTTPExporter = 0x02
-)
-
-const (
 	LogLevel = logger.LevelInfo
 	LogMode  = logger.ModeDevelopment
 
+	LogExporter  = 0x01
+	HTTPExporter = 0x02
+
 	// ExportersEnabled = LogExporter
 	ExportersEnabled = HTTPExporter
-
-	CollectInterval = 2 * time.Second
-	ExportInterval  = 10 * time.Second
-	ShutdownTimeout = 3 * time.Second
-
-	RandomValueMin = 0
-	RandomValueMax = 9999
-
-	HTTPExporterHost    = "127.0.0.1"
-	HTTPExporterPort    = 8080
-	HTTPExporterTimeout = 3 * time.Second
 )
 
 func main() {
-	// Init context
-	ctx, cancel := context.WithCancel(context.Background())
-
 	// Init logger
-	logger.Init(LogLevel, LogMode)
-	logger.Infof("Logger started")
+	ctx := logger.Init(context.Background(), LogLevel, LogMode)
+	logger.New(ctx).Infof("Logger started")
+
+	// Get context with cancel func for graceful shutdown
+	ctx, cancel := context.WithCancel(ctx)
+
+	// Init config
+	cfg, err := config.LoadAgentConfig(config.FromEnv)
+	if err != nil {
+		logger.New(ctx).Fatalf("Cannot load config: %s", err.Error())
+	}
 
 	// Init buffer for metrics
 	metricsBuffer := buffering.NewInMemBuffer()
 
 	// Init agent
-	agent := NewAgent(AgentSettings{CollectInterval: CollectInterval, ExportInterval: ExportInterval}, metricsBuffer)
+	agent := NewAgent(cfg, metricsBuffer)
 
 	// Init collectors
 	runtimeCollector := collectors.NewRuntimeCollector("runtime")
 	pollCountCollector := collectors.NewPollCountCollector("poll-count")
-	randomCollector, err := collectors.NewRandomCollector("random", RandomValueMin, RandomValueMax)
+	randomCollector, err := collectors.NewRandomCollector("random", cfg.RandomExporter)
 	if err != nil {
-		logger.Fatalf("Cannot start random collector: %s", err.Error())
+		logger.New(ctx).Fatalf("Cannot start random collector: %s", err.Error())
 	}
 
 	// Provide collectors to agent
@@ -72,37 +66,33 @@ func main() {
 	}
 	if exporterEnabled(HTTPExporter) {
 		// HTTPExporter is the main exporter for Yandex-Practicum tasks
-		httpExporter := exporters.NewHTTPExporter("http", exporters.HTTPExporterSettings{
-			Host:    HTTPExporterHost,
-			Port:    HTTPExporterPort,
-			Timeout: HTTPExporterTimeout,
-		})
+		httpExporter := exporters.NewHTTPExporter("http", cfg.HTTPExporter)
 		agent.AddExporter(httpExporter)
 	}
 
 	// Start agent
 	go agent.StartCollecting(ctx)
-	// Wait one CollectInterval before running first export
-	time.AfterFunc(CollectInterval, func() {
+	// Wait one collectInterval before running first export
+	time.AfterFunc(time.Duration(cfg.CollectInterval), func() {
 		agent.StartExporting(ctx)
 	})
-	logger.Infof("Agent started")
+	logger.New(ctx).Infof("Agent started")
 
 	// Handle OS signals for graceful shutdown
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	sig := <-quit
-	logger.Infof("OS signal received: %s", sig)
+	logger.New(ctx).Infof("OS signal received: %s", sig)
 
 	// Allow some time for collectors/exporters to finish their job
-	time.AfterFunc(ShutdownTimeout, func() {
-		logger.Fatalf("Agent force-stopped (shutdown timeout)")
+	time.AfterFunc(time.Duration(cfg.ShutdownTimeout), func() {
+		logger.New(ctx).Fatalf("Agent force-stopped (shutdown timeout)")
 	})
 
 	// Call cancel function and stop the agent
 	cancel()
 	agent.Stop()
-	logger.Infof("Agent stopped")
+	logger.New(ctx).Infof("Agent stopped")
 }
 
 func exporterEnabled(exporter int) bool {
